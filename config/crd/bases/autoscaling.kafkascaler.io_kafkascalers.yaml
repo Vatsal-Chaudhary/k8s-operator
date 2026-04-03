@@ -1,0 +1,100 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kafkascalers.autoscaling.kafkascaler.io
+spec:
+  group: autoscaling.kafkascaler.io
+  names:
+    kind: KafkaScaler
+    listKind: KafkaScalerList
+    plural: kafkascalers
+    singular: kafkascaler
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - jsonPath: .metadata.name
+          name: Name
+          type: string
+        - jsonPath: .status.currentLag
+          name: CurrentLag
+          type: integer
+        - jsonPath: .status.currentReplicas
+          name: CurrentReplicas
+          type: integer
+        - jsonPath: .status.lastScaleTime
+          name: LastScaleTime
+          type: date
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              properties:
+                topic:
+                  type: string
+                consumerGroup:
+                  type: string
+                deploymentName:
+                  type: string
+                targetNamespace:
+                  type: string
+                minReplicas:
+                  type: integer
+                  format: int32
+                  minimum: 1
+                maxReplicas:
+                  type: integer
+                  format: int32
+                  minimum: 1
+                lagPerReplica:
+                  type: integer
+                  format: int64
+                cooldownSeconds:
+                  type: integer
+                kafkaBrokers:
+                  type: array
+                  items:
+                    type: string
+            status:
+              type: object
+              properties:
+                currentReplicas:
+                  type: integer
+                  format: int32
+                currentLag:
+                  type: integer
+                  format: int64
+                lastScaleTime:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      observedGeneration:
+                        type: integer
+                        format: int64
+      subresources:
+        status: {}
