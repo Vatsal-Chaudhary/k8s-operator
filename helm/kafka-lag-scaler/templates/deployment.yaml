@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kafka-lag-scaler.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kafka-lag-scaler.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "kafka-lag-scaler.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kafka-lag-scaler.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "kafka-lag-scaler.fullname" . }}
+      containers:
+        - name: kafka-lag-scaler
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--leader-elect={{ .Values.leaderElection.enabled }}"
+            - "--health-probe-bind-address=:8081"
+            - "--metrics-bind-address=127.0.0.1:8080"
+          ports:
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true

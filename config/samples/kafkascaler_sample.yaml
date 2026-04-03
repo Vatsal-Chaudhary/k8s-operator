@@ -1,0 +1,37 @@
+apiVersion: autoscaling.kafkascaler.io/v1alpha1
+kind: KafkaScaler
+metadata:
+  name: orders-consumer-scaler
+  namespace: default
+spec:
+  # The Kafka topic to monitor for consumer lag
+  topic: "orders"
+
+  # The consumer group whose lag drives scaling decisions
+  consumerGroup: "orders-processor"
+
+  # The Deployment to scale (must exist before applying this CR)
+  deploymentName: "orders-worker"
+
+  # Namespace where the target Deployment lives
+  targetNamespace: "default"
+
+  # Never scale below this many replicas, even when lag is zero
+  minReplicas: 2
+
+  # Hard ceiling — never exceed this regardless of lag
+  maxReplicas: 20
+
+  # Scale up 1 replica for every N messages of lag
+  # e.g. lag=4500 → ceil(4500/1000) = 5 replicas
+  lagPerReplica: 1000
+
+  # Minimum seconds between scale actions (prevents flapping)
+  # 120s = operator will not act more than once every 2 minutes
+  cooldownSeconds: 120
+
+  # Kafka broker addresses (comma-separated if multiple)
+  kafkaBrokers:
+    - "kafka-broker-0.kafka.default.svc.cluster.local:9092"
+    - "kafka-broker-1.kafka.default.svc.cluster.local:9092"
+    - "kafka-broker-2.kafka.default.svc.cluster.local:9092"

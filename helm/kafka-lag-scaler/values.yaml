@@ -1,0 +1,20 @@
+image:
+  repository: ghcr.io/vatsal-chaudhary/kafka-lag-scaler
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1 # operator replicas (set to 2 for HA + leaderElection)
+
+leaderElection:
+  enabled: true # always true in production
+
+nameOverride: ""
+fullnameOverride: ""
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi

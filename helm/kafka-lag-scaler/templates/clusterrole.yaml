@@ -1,0 +1,25 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kafka-lag-scaler.fullname" . }}
+  labels:
+    {{- include "kafka-lag-scaler.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["autoscaling.kafkascaler.io"]
+    resources: ["kafkascalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling.kafkascaler.io"]
+    resources: ["kafkascalers/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["autoscaling.kafkascaler.io"]
+    resources: ["kafkascalers/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
