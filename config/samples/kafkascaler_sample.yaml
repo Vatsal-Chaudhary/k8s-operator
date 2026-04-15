@@ -30,8 +30,7 @@ spec:
   # 120s = operator will not act more than once every 2 minutes
   cooldownSeconds: 120
 
-  # Kafka broker addresses (comma-separated if multiple)
+  # Kafka broker addresses (for local minikube demo we use Redpanda service DNS)
+  # Replace with your Kafka bootstrap service in real environments.
   kafkaBrokers:
-    - "kafka-broker-0.kafka.default.svc.cluster.local:9092"
-    - "kafka-broker-1.kafka.default.svc.cluster.local:9092"
-    - "kafka-broker-2.kafka.default.svc.cluster.local:9092"
+    - "redpanda.redpanda.svc.cluster.local:9093"
