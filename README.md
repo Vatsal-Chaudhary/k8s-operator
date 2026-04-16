@@ -1,108 +1,48 @@
 # kafka-lag-scaler
 
-"A Kubernetes controller written in Go that implements the reconciliation pattern to autoscale workloads based on real-time Kafka consumer lag."
+Kubernetes operator that scales a target Deployment based on Kafka consumer-group lag instead of CPU.
 
-## How it works
+## Overview
 
-`kafka-lag-scaler` stores desired state as a `KafkaScaler` custom resource in the Kubernetes API server, which persists that state in etcd and emits watch events when resources change. The controller-runtime reconciler consumes those events and runs an Observe → Diff → Act → Requeue loop: it observes the `KafkaScaler`, reads Kafka consumer lag through the Kafka Admin API, diffs desired replicas against current deployment state, and patches the target `Deployment` when the lag policy requires a change. Status is written back to the `KafkaScaler` status subresource so the resource itself becomes the distributed control plane record for the controller's latest observation. The system is intentionally eventually consistent: changes propagate through watch events and periodic requeues rather than synchronous request/response hooks.
+This project introduces a `KafkaScaler` custom resource. You provide the topic, consumer group, target deployment, and scaling policy (`minReplicas`, `maxReplicas`, `lagPerReplica`, cooldown). The controller periodically reads Kafka lag, calculates desired replicas, patches the target Deployment, and updates `KafkaScaler` status so you can observe current lag and scaling decisions.
 
-## Architecture diagram
-
-```text
-                +-----------------------------+
-                | KafkaScaler CR              |
-                | spec + status               |
-                +-------------+---------------+
-                              |
-                              v
-                +-----------------------------+
-                | Kubernetes API Server       |
-                | persisted in etcd           |
-                +-------------+---------------+
-                              |
-                       watch / get / update
-                              |
-                              v
-                +-----------------------------+
-                | kafka-lag-scaler Operator   |
-                | reconcile loop              |
-                +------+------+---------------+
-                       |      |
-           get lag     |      | patch replicas
-                       |      |
-                       v      v
-        +-----------------+  +----------------------+
-        | Kafka Admin API |  | Target Deployment    |
-        | end/commit offs |  | spec.replicas        |
-        +-----------------+  +----------------------+
-                       \
-                        \ update status
-                         \
-                          v
-                +-----------------------------+
-                | KafkaScaler Status          |
-                | currentLag / replicas / cond|
-                +-----------------------------+
-```
-
-## Key distributed systems concepts implemented
-
-- Reconciliation loop pattern
-- etcd as distributed state store plus watch events
-- Eventual consistency via `RequeueAfter`, not webhooks
-- Leader election with a Kubernetes `Lease` for active-passive HA
-- Optimistic concurrency with `Patch` + `MergeFrom`, not `Update`
-- Status/spec separation where users write spec and the controller writes status
-
-## Project structure
-
-```text
-.
-├── api/
-│   └── v1alpha1/
-│       ├── groupversion_info.go            # API group/version registration and AddToScheme
-│       ├── kafkascaler_types.go            # KafkaScaler spec/status types and CRD markers
-│       └── zz_generated.deepcopy.go        # Runtime deepcopy implementations for API objects
-├── internal/
-│   └── controller/
-│       ├── kafka_client.go                 # franz-go Kafka admin client for computing consumer lag
-│       ├── kafkascaler_controller.go       # Reconciler, finalizers, status updates, deployment patching
-│       ├── kafkascaler_controller_test.go  # envtest integration cases for scale up, cooldown, and scale down
-│       ├── scaler.go                       # Pure scaling policy functions
-│       ├── scaler_test.go                  # Unit tests for replica math and cooldown logic
-│       └── suite_test.go                   # envtest suite bootstrap, manager startup, shared mock lag fetcher
-├── config/
-│   ├── crd/
-│   │   └── bases/
-│   │       └── autoscaling.kafkascaler.io_kafkascalers.yaml # CRD manifest used by envtest and packaging
-│   └── samples/
-│       └── kafkascaler_sample.yaml        # Demo custom resource for quickstart and live walkthroughs
-├── helm/
-│   └── kafka-lag-scaler/
-│       ├── Chart.yaml                     # Helm chart metadata
-│       ├── crds/
-│       │   └── kafkascalers.yaml          # Native Helm CRD installation payload
-│       ├── templates/
-│       │   ├── _helpers.tpl               # Naming and label helpers
-│       │   ├── clusterrole.yaml           # Cluster-scoped RBAC for CRD, deployments, events, and leases
-│       │   ├── clusterrolebinding.yaml    # Binds operator RBAC to the service account
-│       │   ├── deployment.yaml            # Operator deployment with leader election and health probes
-│       │   └── serviceaccount.yaml        # Service account used by the controller
-│       └── values.yaml                    # Install-time overrides for image, HA, and resources
-├── go.mod                                 # Module definition and direct dependencies
-└── go.sum                                 # Dependency checksums
-```
-
-## Quickstart
-
-### Prerequisites
+## Prerequisites
 
 - Go 1.22+
-- `kubectl` plus `minikube` or `kind`
+- Docker
+- `kubectl`
+- A Kubernetes cluster (`minikube` or `kind`)
 - Helm 3
-- A running Kafka cluster
+- A Kafka-compatible broker reachable from the cluster (Kafka or Redpanda)
 
-### Install the operator
+## Run tests
+
+Unit tests (pure policy logic):
+
+```bash
+go test ./internal/controller -run "TestCalculateReplicas|TestShouldScale" -v
+```
+
+Integration tests (envtest API server + etcd):
+
+```bash
+KUBEBUILDER_ASSETS="$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@latest use -p path 1.29.x)" \
+go test ./internal/controller -run TestController -v
+```
+
+## Running in a real cluster
+
+At a high level, the runtime flow is:
+
+1. Build the operator image from this repo (`Dockerfile`) and make it available to your cluster.
+2. Install the operator chart from `helm/kafka-lag-scaler`.
+3. Deploy the target workload you want to scale (`config/samples/orders-worker.yaml`).
+4. Install a Kafka-compatible broker in the cluster (Kafka or Redpanda) and note its internal service DNS/port.
+5. Apply `KafkaScaler` (`config/samples/kafkascaler_sample.yaml`) with `kafkaBrokers` set to your actual broker endpoint.
+6. Produce backlog in the configured topic/consumer group.
+7. Watch `KafkaScaler` status and target Deployment replicas update.
+
+## Install the operator (Helm)
 
 ```bash
 helm install kafka-lag-scaler ./helm/kafka-lag-scaler \
@@ -110,37 +50,29 @@ helm install kafka-lag-scaler ./helm/kafka-lag-scaler \
   --create-namespace
 ```
 
-### Apply a KafkaScaler
+## Apply sample resources
+
+Target deployment:
+
+```bash
+kubectl apply -f config/samples/orders-worker.yaml
+```
+
+KafkaScaler resource:
 
 ```bash
 kubectl apply -f config/samples/kafkascaler_sample.yaml
 ```
 
-### Watch it work
+## Observe behavior
 
 ```bash
 kubectl get kafkascalers -w
+kubectl get deploy orders-worker -w
+kubectl logs -n kafka-lag-scaler-system deploy/kafka-lag-scaler -f
 ```
 
-Expected output:
+## Notes
 
-```text
-NAME                     CURRENTLAG   CURRENTREPLICAS   LASTSCALETIME
-orders-consumer-scaler   5000         5                 2026-04-03T14:25:11Z
-orders-consumer-scaler   0            2                 2026-04-03T14:29:42Z
-```
-
-## Running tests
-
-1. Unit tests (pure functions, no cluster):
-
-```bash
-go test ./internal/controller -run "TestCalculateReplicas|TestShouldScale" -v
-```
-
-2. Integration tests (envtest, no cluster needed):
-
-```bash
-KUBEBUILDER_ASSETS="$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@latest use -p path 1.29.x)" \
-go test ./internal/controller -run TestController -v
-```
+- The sample `kafkaBrokers` value is tuned for the local Redpanda test setup we used in development.
+- In real environments, replace it with your actual Kafka bootstrap service addresses.
