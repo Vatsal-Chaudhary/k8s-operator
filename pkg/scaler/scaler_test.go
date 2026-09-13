@@ -1,10 +1,8 @@
-package controller
+package scaler
 
 import (
 	"testing"
 	"time"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestCalculateReplicas(t *testing.T) {
@@ -86,57 +84,92 @@ func TestCalculateReplicas(t *testing.T) {
 
 func TestShouldScale(t *testing.T) {
 	now := time.Now()
-	inCooldown := metav1.NewTime(now.Add(-10 * time.Second))
-	cooldownElapsed := metav1.NewTime(now.Add(-200 * time.Second))
+	inCooldown := now.Add(-10 * time.Second)
+	cooldownElapsed := now.Add(-200 * time.Second)
 
 	tests := []struct {
 		name            string
-		lastScaleTime   *metav1.Time
-		cooldownSeconds int
+		lastScaleTime   *time.Time
+		cooldown        time.Duration
 		currentReplicas int32
 		desiredReplicas int32
 		expected        bool
+		expectedReason  Reason
 	}{
 		{
 			name:            "returns false when replicas already match",
 			lastScaleTime:   nil,
-			cooldownSeconds: 120,
+			cooldown:        120 * time.Second,
 			currentReplicas: 5,
 			desiredReplicas: 5,
 			expected:        false,
+			expectedReason:  ReasonReplicasUnchanged,
 		},
 		{
 			name:            "returns true when never scaled before",
 			lastScaleTime:   nil,
-			cooldownSeconds: 120,
+			cooldown:        120 * time.Second,
 			currentReplicas: 2,
 			desiredReplicas: 5,
 			expected:        true,
+			expectedReason:  ReasonNeverScaled,
 		},
 		{
 			name:            "returns false while in cooldown",
 			lastScaleTime:   &inCooldown,
-			cooldownSeconds: 120,
+			cooldown:        120 * time.Second,
 			currentReplicas: 2,
 			desiredReplicas: 5,
 			expected:        false,
+			expectedReason:  ReasonCooldownActive,
 		},
 		{
 			name:            "returns true after cooldown elapses",
 			lastScaleTime:   &cooldownElapsed,
-			cooldownSeconds: 120,
+			cooldown:        120 * time.Second,
 			currentReplicas: 2,
 			desiredReplicas: 5,
 			expected:        true,
+			expectedReason:  ReasonCooldownElapsed,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := ShouldScale(tt.lastScaleTime, tt.cooldownSeconds, tt.currentReplicas, tt.desiredReplicas)
+			result, reason := ShouldScale(tt.lastScaleTime, tt.cooldown, tt.currentReplicas, tt.desiredReplicas)
 			if result != tt.expected {
-				t.Fatalf("ShouldScale(%v, %d, %d, %d) = %t, want %t", tt.lastScaleTime, tt.cooldownSeconds, tt.currentReplicas, tt.desiredReplicas, result, tt.expected)
+				t.Fatalf("ShouldScale(%v, %s, %d, %d) = %t, want %t", tt.lastScaleTime, tt.cooldown, tt.currentReplicas, tt.desiredReplicas, result, tt.expected)
+			}
+
+			if reason != tt.expectedReason {
+				t.Fatalf("ShouldScale(%v, %s, %d, %d) reason = %q, want %q", tt.lastScaleTime, tt.cooldown, tt.currentReplicas, tt.desiredReplicas, reason, tt.expectedReason)
 			}
 		})
+	}
+}
+
+func TestDecide(t *testing.T) {
+	lastScaleTime := time.Now().Add(-200 * time.Second)
+
+	decision := Decide(Input{
+		CurrentLag:      4500,
+		MinReplicas:     2,
+		MaxReplicas:     20,
+		LagPerReplica:   1000,
+		Cooldown:        120 * time.Second,
+		LastScaleTime:   &lastScaleTime,
+		CurrentReplicas: 2,
+	})
+
+	if decision.DesiredReplicas != 5 {
+		t.Fatalf("Decision.DesiredReplicas = %d, want 5", decision.DesiredReplicas)
+	}
+
+	if !decision.ScaleNow {
+		t.Fatal("Decision.ScaleNow = false, want true")
+	}
+
+	if decision.Reason != ReasonCooldownElapsed {
+		t.Fatalf("Decision.Reason = %q, want %q", decision.Reason, ReasonCooldownElapsed)
 	}
 }

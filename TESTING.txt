@@ -1,0 +1,312 @@
+kafka-lag-scaler local testing walkthrough (minikube)
+
+Goal of this document
+- Explain what we tested in this session.
+- Explain every command, what it does, and why we ran it.
+- Explain issues we hit and how we resolved them.
+- Explain the runtime flow after Docker build through minikube deployment.
+
+IMPORTANT
+- This file is intentionally not committed to git (per request).
+
+--------------------------------------------------------------------
+1) Big picture: what we are testing
+--------------------------------------------------------------------
+
+We tested two things:
+1. The operator process itself starts correctly in Kubernetes.
+2. The operator can read Kafka lag and scale a target Deployment.
+
+End-to-end control flow we validated:
+1. Build operator image from repo.
+2. Load image into minikube node.
+3. Install operator using Helm chart.
+4. Apply target Deployment (orders-worker).
+5. Apply KafkaScaler CR.
+6. Install a Kafka-compatible broker (Redpanda).
+7. Produce backlog to Kafka topic.
+8. Observe KafkaScaler status and Deployment replica changes.
+
+--------------------------------------------------------------------
+2) Why Docker build is needed
+--------------------------------------------------------------------
+
+Command used:
+docker build -t ghcr.io/vatsal-chaudhary/kafka-lag-scaler:latest .
+
+What it does:
+- Builds a container image using Dockerfile.
+- Compiles Go code into binary (main.go is entrypoint).
+- Produces runnable image for Kubernetes pods.
+
+Why needed:
+- Kubernetes runs containers, not raw Go source code.
+- Helm Deployment references an image, so image must exist first.
+
+Issue we hit:
+- Initial tag used uppercase username and failed:
+  invalid tag ... repository name must be lowercase
+Fix:
+- Use lowercase path in image name:
+  ghcr.io/vatsal-chaudhary/kafka-lag-scaler:latest
+
+--------------------------------------------------------------------
+3) Why minikube image load is needed
+--------------------------------------------------------------------
+
+Command used:
+minikube image load ghcr.io/vatsal-chaudhary/kafka-lag-scaler:latest
+
+What it does:
+- Copies the locally built image into minikube node runtime.
+
+Why needed:
+- Minikube cluster cannot automatically see your local Docker images.
+- This avoids having to push to remote registry for local testing.
+
+--------------------------------------------------------------------
+4) Operator install with Helm
+--------------------------------------------------------------------
+
+Command used:
+helm install kafka-lag-scaler ./helm/kafka-lag-scaler \
+  --namespace kafka-lag-scaler-system \
+  --create-namespace \
+  --set image.repository=ghcr.io/vatsal-chaudhary/kafka-lag-scaler \
+  --set image.tag=latest
+
+What it does:
+- Installs CRD, ServiceAccount, ClusterRole, ClusterRoleBinding, Deployment.
+
+Why Helm:
+- Single reproducible install command.
+- Values override for image repository/tag.
+
+Issue we hit:
+- Pod failed with CreateContainerConfigError:
+  runAsNonRoot and image has non-numeric user (nonroot)
+
+Fix applied in code/chart:
+- Dockerfile set numeric user: USER 65532:65532
+- Helm deployment securityContext set runAsUser/runAsGroup 65532
+
+Result after fix:
+- Operator pod reached Running.
+- Logs confirmed manager start, leader election, worker start.
+
+--------------------------------------------------------------------
+5) Target workload deployment
+--------------------------------------------------------------------
+
+File created:
+config/samples/orders-worker.yaml
+
+Command used:
+kubectl apply -f config/samples/orders-worker.yaml
+
+What it does:
+- Creates the Deployment that KafkaScaler controls.
+
+Why needed:
+- Operator patches existing Deployment.spec.replicas.
+- If Deployment does not exist, operator sets DeploymentNotFound condition.
+
+--------------------------------------------------------------------
+6) Kafka broker setup attempts and issues
+--------------------------------------------------------------------
+
+First attempt: Bitnami Kafka chart.
+
+Command used (initial):
+helm install kafka bitnami/kafka ...
+
+Issues encountered:
+1) DNS failures (before broker existed):
+   no such host for kafka-broker-*.svc.cluster.local
+2) Bitnami image pull failures:
+   manifest unknown for tags like 4.0.0-debian-12-r10 and r9
+
+How we diagnosed:
+- kubectl describe pod in kafka namespace
+- saw ImagePullBackOff and ErrImagePull events
+
+What we did:
+- Uninstalled broken Kafka release:
+  helm uninstall kafka -n kafka
+
+Second attempt: Redpanda chart (Kafka API compatible).
+
+First Redpanda install failed:
+- Missing cert-manager CRDs for Certificate/Issuer resources.
+
+Fix:
+- Install Redpanda with TLS/cert-manager path disabled.
+
+Successful command used:
+helm install redpanda redpanda/redpanda \
+  -n redpanda \
+  --create-namespace \
+  --set statefulset.replicas=1 \
+  --set tls.enabled=false \
+  --set external.enabled=false \
+  --set external.service.enabled=false \
+  --set auth.sasl.enabled=false \
+  --set listeners.kafka.authenticationMethod=none \
+  --set listeners.admin.authenticationMethod=none \
+  --set listeners.schemaRegistry.enabled=false \
+  --set listeners.http.enabled=false \
+  --set console.enabled=false
+
+Result:
+- redpanda-0 became Running.
+
+--------------------------------------------------------------------
+7) Updating KafkaScaler broker addresses
+--------------------------------------------------------------------
+
+Why needed:
+- Sample initially had placeholder Kafka broker DNS names.
+- Operator could not resolve/connect.
+
+Command used:
+kubectl patch kafkascaler orders-consumer-scaler --type merge \
+  -p '{"spec":{"kafkaBrokers":["redpanda.redpanda.svc.cluster.local:9093"]}}'
+
+Result:
+- Operator successfully fetched lag from Redpanda.
+
+Note:
+- Sample YAML was updated to Redpanda local demo broker:
+  redpanda.redpanda.svc.cluster.local:9093
+
+--------------------------------------------------------------------
+8) Creating load (lag) in topic
+--------------------------------------------------------------------
+
+Client pod command:
+kubectl run rp-client -n redpanda --restart=Never \
+  --image=docker.redpanda.com/redpandadata/redpanda:v25.3.13 \
+  --command -- sleep infinity
+
+Wait + shell:
+kubectl wait --for=condition=Ready pod/rp-client -n redpanda --timeout=180s
+kubectl exec -it rp-client -n redpanda -- sh
+
+Inside pod:
+BROKER=redpanda.redpanda.svc.cluster.local:9093
+rpk topic create orders --brokers $BROKER
+for i in $(seq 1 5000); do echo "msg-$i"; done | rpk topic produce orders --brokers $BROKER
+
+Important mistake encountered:
+- Tried to consume with wrong command:
+  rpk group consume ... (unsupported in this rpk version)
+
+Correct approach for this version:
+- Use topic consume with group:
+  rpk topic consume orders -g orders-processor --brokers $BROKER -o start -n 1
+
+Even without consume step, if no committed offsets exist, lag can be treated as full topic end offset and still trigger scaling.
+
+--------------------------------------------------------------------
+9) Observability commands used and interpretation
+--------------------------------------------------------------------
+
+Operator logs:
+kubectl logs -n kafka-lag-scaler-system deploy/kafka-lag-scaler -f
+
+KafkaScaler watch:
+kubectl get kafkascaler orders-consumer-scaler -w
+
+Deployment watch:
+kubectl get deploy orders-worker -w
+
+What we observed:
+- Lag fetched: 5000
+- Desired replicas computed: 5
+- Deployment patched from 2 to 5
+- orders-worker progressed to 5/5 ready
+
+This confirms full end-to-end behavior.
+
+--------------------------------------------------------------------
+10) Why reconcile sometimes logs "Skipping scale action"
+--------------------------------------------------------------------
+
+This is expected when:
+- currentReplicas == desiredReplicas, or
+- cooldown window prevents immediate further action.
+
+In session logs:
+- Once replicas reached 5 and desired stayed 5, skipping was correct.
+
+--------------------------------------------------------------------
+11) Code/runtime flow after Docker build (simple)
+--------------------------------------------------------------------
+
+1) Docker build
+- Compiles main.go + controller code into container image.
+
+2) minikube image load
+- Makes image available to minikube kubelet/container runtime.
+
+3) helm install operator
+- Creates CRD + RBAC + operator Deployment.
+
+4) operator pod starts
+- main.go creates manager, registers scheme, starts reconciler.
+- leader election acquires Lease.
+
+5) KafkaScaler applied
+- watch event triggers reconcile.
+
+6) reconcile loop
+- GET KafkaScaler
+- ensure finalizer
+- fetch lag from broker
+- CalculateReplicas
+- ShouldScale
+- patch target Deployment.spec.replicas
+- update KafkaScaler status
+
+7) deployment controller reaction
+- Kubernetes built-in deployment controller creates/deletes pods to match new replicas.
+
+--------------------------------------------------------------------
+12) Commands to stop/cleanup local environment
+--------------------------------------------------------------------
+
+Uninstall operator:
+helm uninstall kafka-lag-scaler -n kafka-lag-scaler-system
+
+Uninstall redpanda:
+helm uninstall redpanda -n redpanda
+
+Delete namespaces:
+kubectl delete ns kafka-lag-scaler-system --wait=true
+kubectl delete ns redpanda --wait=true
+
+Delete app + CR in default namespace:
+kubectl delete -f config/samples/kafkascaler_sample.yaml --ignore-not-found
+kubectl delete -f config/samples/orders-worker.yaml --ignore-not-found
+
+Stop minikube cluster (keeps profile data):
+minikube stop
+
+Delete minikube cluster completely (fresh next time):
+minikube delete
+
+--------------------------------------------------------------------
+13) Optional rerun checklist (clean)
+--------------------------------------------------------------------
+
+1. minikube start
+2. docker build operator image
+3. minikube image load operator image
+4. helm install kafka-lag-scaler chart
+5. apply orders-worker deployment
+6. helm install redpanda (TLS off)
+7. patch KafkaScaler broker to redpanda service
+8. create topic + produce messages using rp-client
+9. watch kafkascaler + deployment + operator logs
+
+End of testing notes.

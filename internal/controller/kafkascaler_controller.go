@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1alpha1 "github.com/Vatsal-Chaudhary/k8s-operator/api/v1alpha1"
+	scaling "github.com/Vatsal-Chaudhary/k8s-operator/pkg/scaler"
 )
 
 const kafkaScalerFinalizer = "autoscaling.kafkascaler.io/finalizer"
@@ -100,32 +101,38 @@ func (r *KafkaScalerReconciler) Reconcile(
 
 	logger.Info("Fetched Kafka lag", "lag", lag)
 
-	desiredReplicas := CalculateReplicas(
-		lag,
-		scaler.Spec.LagPerReplica,
-		scaler.Spec.MinReplicas,
-		scaler.Spec.MaxReplicas,
-	)
+	var lastScaleTime *time.Time
+	if scaler.Status.LastScaleTime != nil {
+		last := scaler.Status.LastScaleTime.Time
+		lastScaleTime = &last
+	}
+
+	decision := scaling.Decide(scaling.Input{
+		CurrentLag:      lag,
+		MinReplicas:     scaler.Spec.MinReplicas,
+		MaxReplicas:     scaler.Spec.MaxReplicas,
+		LagPerReplica:   scaler.Spec.LagPerReplica,
+		Cooldown:        time.Duration(scaler.Spec.CooldownSeconds) * time.Second,
+		LastScaleTime:   lastScaleTime,
+		CurrentReplicas: scaler.Status.CurrentReplicas,
+	})
 
 	logger.Info(
 		"Calculated desired replicas",
 		"currentReplicas", scaler.Status.CurrentReplicas,
-		"desiredReplicas", desiredReplicas,
+		"desiredReplicas", decision.DesiredReplicas,
 		"lag", lag,
+		"reason", decision.Reason,
 	)
 
-	if !ShouldScale(
-		scaler.Status.LastScaleTime,
-		scaler.Spec.CooldownSeconds,
-		scaler.Status.CurrentReplicas,
-		desiredReplicas,
-	) {
+	if !decision.ScaleNow {
 		logger.Info(
 			"Skipping scale action",
 			"currentReplicas", scaler.Status.CurrentReplicas,
-			"desiredReplicas", desiredReplicas,
+			"desiredReplicas", decision.DesiredReplicas,
 			"lastScaleTime", scaler.Status.LastScaleTime,
 			"cooldownSeconds", scaler.Spec.CooldownSeconds,
+			"reason", decision.Reason,
 		)
 
 		scaler.Status.CurrentLag = lag
@@ -170,13 +177,14 @@ func (r *KafkaScalerReconciler) Reconcile(
 	}
 
 	patch := client.MergeFrom(deployment.DeepCopy())
-	deployment.Spec.Replicas = &desiredReplicas
+	deployment.Spec.Replicas = &decision.DesiredReplicas
 
 	logger.Info(
 		"Patching target Deployment replicas",
 		"deploymentNamespace", deployment.Namespace,
 		"deploymentName", deployment.Name,
-		"replicas", desiredReplicas,
+		"replicas", decision.DesiredReplicas,
+		"reason", decision.Reason,
 	)
 
 	if err := r.Patch(ctx, deployment, patch); err != nil {
@@ -184,7 +192,7 @@ func (r *KafkaScalerReconciler) Reconcile(
 	}
 
 	now := metav1.Now()
-	scaler.Status.CurrentReplicas = desiredReplicas
+	scaler.Status.CurrentReplicas = decision.DesiredReplicas
 	scaler.Status.CurrentLag = lag
 	scaler.Status.LastScaleTime = &now
 	setCondition(
@@ -192,7 +200,7 @@ func (r *KafkaScalerReconciler) Reconcile(
 		"Scaled",
 		metav1.ConditionTrue,
 		"LagThresholdExceeded",
-		fmt.Sprintf("scaled deployment to %d replicas for lag %d", desiredReplicas, lag),
+		fmt.Sprintf("scaled deployment to %d replicas for lag %d", decision.DesiredReplicas, lag),
 	)
 
 	logger.Info(
